@@ -6,12 +6,11 @@ from typing import List, Optional, Dict
 from datetime import datetime
 import logging
 
-from app.langchain_engine.chat import ChatEngine
+from app.langchain_engine.query_router import get_query_router, QueryIntent
+from app.langchain_engine.query_handlers import get_query_handlers
 from app.langchain_engine.parsers import (
     get_analysis_parser,
-    get_chat_parser,
     StockAnalysisOutput,
-    ChatResponseOutput
 )
 
 logger = logging.getLogger(__name__)
@@ -21,33 +20,43 @@ router = APIRouter()
 # Request/Response Models
 
 class ChatRequest(BaseModel):
-    """Chat request model."""
+    """Chat request model - ticker is now OPTIONAL!"""
     query: str = Field(..., min_length=3, max_length=500, description="User's question")
-    ticker: Optional[str] = Field(None, description="Stock ticker (optional, will be extracted if not provided)")
+    ticker: Optional[str] = Field(None, description="Stock ticker (optional - will be auto-detected)")
     chat_history: Optional[List[Dict]] = Field(None, description="Previous conversation turns")
     structured: bool = Field(False, description="Return structured output (for analysis queries)")
     
     class Config:
         json_schema_extra = {
-            "example": {
-                "query": "Should I buy AAPL stock?",
-                "ticker": "AAPL",
-                "structured": False
-            }
+            "examples": [
+                {
+                    "query": "What's the latest news?",
+                    "ticker": None
+                },
+                {
+                    "query": "Should I buy AAPL stock?",
+                    "ticker": "AAPL"
+                },
+                {
+                    "query": "Analyze Apple stock",
+                    "ticker": None
+                }
+            ]
         }
 
 
 class Source(BaseModel):
     """News source reference."""
     title: str
-    url: str
-    source: str
-    published_at: str
-    similarity: float
+    url: str = ""
+    source: str = ""
+    published_at: str = ""
+    similarity: float = 0.0
+    ticker: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
-    """Chat response model."""
+    """Enhanced chat response with routing info."""
     response: str
     ticker: Optional[str] = None
     signal: Optional[str] = None
@@ -56,47 +65,63 @@ class ChatResponse(BaseModel):
     context_retrieved: bool = False
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     
+    # New fields for debugging/transparency
+    intent: Optional[str] = None
+    handler: Optional[str] = None
+    
     class Config:
         json_schema_extra = {
             "example": {
-                "response": "Based on the latest analysis...",
-                "ticker": "AAPL",
-                "signal": "BUY",
-                "confidence": 0.67,
+                "response": "Here are today's top news stories...",
+                "ticker": None,
+                "signal": None,
+                "confidence": None,
                 "sources": [],
                 "context_retrieved": True,
-                "timestamp": "2025-12-15T10:30:00"
+                "timestamp": "2025-12-25T10:30:00",
+                "intent": "top_news",
+                "handler": "handle_top_news"
             }
         }
 
 
-# Endpoints
+# Main Chat Endpoint with Intelligent Routing
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest = Body(...)):
+    """
+    🎯 INTELLIGENT CHAT ENDPOINT
+    
+    Automatically detects intent and routes to appropriate handler:
+    - "What's the latest news?" → Top news handler
+    - "Analyze AAPL" → Stock analysis handler
+    - "Best stocks to buy?" → Recommendation handler
+    - And more!
+    
+    No need to specify ticker for general queries!
+    """
     try:
-        logger.info(f"Chat request: {request.query[:50]}... (structured={request.structured})")
+        logger.info(f"📥 Chat request: '{request.query[:60]}...'")
         
-        # Initialize chat engine
-        engine = ChatEngine()
+        # Step 1: Classify the query intent
+        router_instance = get_query_router()
+        context, handler_name = router_instance.route_query(request.query)
         
-        # If structured output requested, enhance query with format instructions
-        query = request.query
-        if request.structured:
-            parser = get_analysis_parser()
-            query = f"{request.query}\n\n{parser.get_format_instructions()}"
+        logger.info(f"🎯 Detected intent: {context.intent}, Handler: {handler_name}")
+        logger.info(f"📍 Extracted tickers: {context.tickers}")
         
-        # Generate response
-        result = engine.generate_response(
-            query=query,
-            ticker=request.ticker,
-            chat_history=request.chat_history
-        )
+        # Override ticker if provided explicitly
+        if request.ticker:
+            context.tickers = [request.ticker]
         
-        # FIX: Properly map the result to ChatResponse
-        # The result dict might have different keys, so we map them carefully
+        # Step 2: Get the appropriate handler
+        handlers = get_query_handlers()
+        handler_method = getattr(handlers, handler_name)
         
-        # Extract sources and convert to Source objects if needed
+        # Step 3: Process the query with the specialized handler
+        result = handler_method(context, request.query)
+        
+        # Step 4: Convert sources to Source objects
         sources = []
         if 'sources' in result and result['sources']:
             for src in result['sources']:
@@ -106,43 +131,61 @@ async def chat(request: ChatRequest = Body(...)):
                         url=src.get('url', ''),
                         source=src.get('source', ''),
                         published_at=src.get('published_at', ''),
-                        similarity=src.get('similarity', 0.0)
+                        similarity=src.get('similarity', 0.0),
+                        ticker=src.get('ticker')
                     ))
                 except Exception as e:
                     logger.warning(f"Could not parse source: {e}")
         
-        # Build response with all required fields
+        # Step 5: Build response
+        # FIX: context.intent is already a string due to use_enum_values=True
+        intent_str = context.intent if isinstance(context.intent, str) else context.intent.value
+        
         return ChatResponse(
-            response=result.get('response', "I don't have enough data about this stock."),
+            response=result.get('response', "I couldn't process your request."),
             ticker=result.get('ticker'),
             signal=result.get('signal'),
             confidence=result.get('confidence'),
             sources=sources,
             context_retrieved=result.get('context_retrieved', False),
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.utcnow().isoformat(),
+            intent=intent_str,
+            handler=handler_name
         )
         
     except Exception as e:
-        logger.error(f"Chat endpoint error: {e}")
+        logger.error(f"❌ Chat endpoint error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing chat request: {str(e)}"
+        
+        return ChatResponse(
+            response=(
+                "I encountered an error processing your request. "
+                "Please try rephrasing your question or try again later.\n\n"
+                "⚠️ **Disclaimer**: This is educational information only, not financial advice."
+            ),
+            context_retrieved=False,
+            intent="error",
+            handler="error"
         )
 
+
+# Specialized Endpoints (still available for direct access)
 
 @router.post("/chat/analyze", response_model=StockAnalysisOutput)
 async def analyze_stock(
     ticker: str = Body(..., embed=True),
     include_news: bool = Body(True, embed=True)
 ):
+    """
+    Dedicated endpoint for structured stock analysis.
+    Returns structured analysis with clear buy/sell/hold recommendation.
+    """
     try:
-        logger.info(f"Analysis request for {ticker}")
+        logger.info(f"📊 Analysis request for {ticker}")
         
         parser = get_analysis_parser()
         
-        # Create analysis query with format instructions
         query = f"""
         Provide a comprehensive analysis of {ticker} stock based on:
         1. Technical indicators (RSI, MACD, Moving Averages)
@@ -152,8 +195,17 @@ async def analyze_stock(
         {parser.get_format_instructions()}
         """
         
-        engine = ChatEngine()
-        result = engine.generate_response(query=query, ticker=ticker)
+        # Use the router for consistency
+        router_instance = get_query_router()
+        handlers = get_query_handlers()
+        
+        from app.langchain_engine.query_router import QueryContext, QueryIntent
+        context = QueryContext(
+            intent=QueryIntent.STOCK_ANALYSIS,
+            tickers=[ticker]
+        )
+        
+        result = handlers.handle_stock_analysis(context, query)
         
         # Parse to structured format
         try:
@@ -162,7 +214,7 @@ async def analyze_stock(
         except Exception as parse_error:
             logger.warning(f"Could not parse structured output: {parse_error}")
             
-            # Fallback: create structured output from raw response
+            # Fallback
             return StockAnalysisOutput(
                 summary=result['response'][:200] + "...",
                 bullish_factors=["See full response for details"],
@@ -183,147 +235,86 @@ async def analyze_stock(
         )
 
 
-@router.post("/chat/explain")
-async def explain_indicator(
-    indicator: str = Body(..., embed=True),
-    ticker: str = Body(..., embed=True)
-):
+@router.get("/chat/suggestions")
+async def get_query_suggestions():
     """
-    Explain a specific technical indicator.
-    
-    Simplified endpoint for indicator explanations.
+    Get example queries users can ask.
+    Shows the power of the intelligent routing system!
     """
-    try:
-        query = f"Explain the {indicator} indicator for {ticker} in simple terms"
-        
-        engine = ChatEngine()
-        result = engine.generate_response(query=query, ticker=ticker)
-        
-        return {
-            "indicator": indicator,
-            "ticker": ticker,
-            "explanation": result.get('response', 'No explanation available'),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Explain indicator error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error explaining indicator: {str(e)}"
-        )
-
-
-@router.post("/chat/compare")
-async def compare_stocks(
-    ticker1: str = Body(..., embed=True),
-    ticker2: str = Body(..., embed=True)
-):
-    """
-    Compare two stocks with structured analysis for each.
-    """
-    try:
-        logger.info(f"Comparing {ticker1} vs {ticker2}")
-        
-        parser = get_analysis_parser()
-        engine = ChatEngine()
-        
-        # Get structured analysis for both
-        query_template = """
-        Analyze {} stock comprehensively.
-        
-        {}
-        """
-        
-        # Analyze first ticker
-        result1 = engine.generate_response(
-            query=query_template.format(ticker1, parser.get_format_instructions()),
-            ticker=ticker1
-        )
-        
-        # Analyze second ticker
-        result2 = engine.generate_response(
-            query=query_template.format(ticker2, parser.get_format_instructions()),
-            ticker=ticker2
-        )
-        
-        # Try to parse structured outputs
-        try:
-            analysis1 = parser.parse(result1['response'])
-        except:
-            analysis1 = None
-            
-        try:
-            analysis2 = parser.parse(result2['response'])
-        except:
-            analysis2 = None
-        
-        return {
-            "ticker1": ticker1,
-            "ticker2": ticker2,
-            "analysis1": analysis1.dict() if analysis1 else {
-                "summary": result1.get('response', ''),
-                "signal": result1.get('signal'),
-                "confidence": result1.get('confidence')
-            },
-            "analysis2": analysis2.dict() if analysis2 else {
-                "summary": result2.get('response', ''),
-                "signal": result2.get('signal'),
-                "confidence": result2.get('confidence')
-            },
-            "comparison_summary": f"Comparing {ticker1} and {ticker2} based on technical and fundamental analysis.",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Compare stocks error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error comparing stocks: {str(e)}"
-        )
-
-
-@router.get("/chat/suggestions/{ticker}")
-async def get_query_suggestions(ticker: str):
-    """
-    Get suggested questions for a ticker.
-    Helps users know what they can ask.
-    """
-    suggestions = [
-        f"What is the latest news about {ticker}?",
-        f"Should I buy {ticker} stock?",
-        f"Analyze {ticker} with technical indicators",
-        f"What are the technical indicators saying about {ticker}?",
-        f"Is {ticker} overvalued or undervalued?",
-        f"What are the risks of investing in {ticker}?",
-        f"How is {ticker} performing compared to its sector?",
-        f"Explain the RSI indicator for {ticker}",
-        f"What is the trend for {ticker}?",
-        f"What are the bullish factors for {ticker}?",
-        f"What are the bearish factors for {ticker}?",
-    ]
+    suggestions = {
+        "Top News": [
+            "What's the latest news?",
+            "Top news today",
+            "Show me recent headlines",
+            "What's happening in the market?"
+        ],
+        "Stock News": [
+            "Latest news on AAPL",
+            "What's happening with Tesla?",
+            "News about Microsoft"
+        ],
+        "Stock Analysis": [
+            "Analyze Apple stock",
+            "Should I buy TSLA?",
+            "How is Google performing?",
+            "Tell me about MSFT"
+        ],
+        "Recommendations": [
+            "Best stocks to buy today",
+            "Recommend some stocks",
+            "What stocks should I invest in?",
+            "Top performers"
+        ],
+        "Price Predictions": [
+            "Will AAPL go up?",
+            "Price forecast for Tesla",
+            "Where is Microsoft headed?"
+        ],
+        "Comparisons": [
+            "Compare AAPL and MSFT",
+            "Apple vs Google",
+            "Tesla versus Ford"
+        ],
+        "Learn": [
+            "What is RSI?",
+            "Explain MACD indicator",
+            "How does the stock market work?"
+        ]
+    }
     
     return {
-        "ticker": ticker,
-        "suggestions": suggestions
+        "categories": suggestions,
+        "note": "You can ask questions naturally - the system will understand!"
     }
 
 
 @router.get("/chat/health")
 async def health_check():
-    """
-    Health check endpoint for chat service.
-    """
+    """Health check endpoint."""
     try:
-        # Test chat engine initialization
-        engine = ChatEngine()
+        # Test components
+        router_instance = get_query_router()
+        handlers = get_query_handlers()
+        
+        # Test classification
+        test_context, test_handler = router_instance.route_query("What's the latest news?")
+        
+        # FIX: Handle intent properly
+        test_intent = test_context.intent if isinstance(test_context.intent, str) else test_context.intent.value
         
         return {
             "status": "healthy",
-            "service": "chat_api",
-            "model": engine.model,
+            "service": "intelligent_chat_api",
+            "components": {
+                "router": "operational",
+                "handlers": "operational",
+                "llm": handlers.chat_engine.model
+            },
+            "test_classification": {
+                "query": "What's the latest news?",
+                "detected_intent": test_intent,
+                "handler": test_handler
+            },
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
