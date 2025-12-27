@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_URL = "http://localhost:8000"
-TEST_TICKERS = ["ABDL"]
+TEST_TICKERS = ["IRFC"]
 
 
 def test_technical_indicators():

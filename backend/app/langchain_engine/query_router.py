@@ -49,9 +49,11 @@ class QueryRouter:
                 r'(?i)news\s+(today|this week)',
             ],
             QueryIntent.STOCK_NEWS: [
-                r'(?i)news\s+(about|on|for|regarding)\s+(\w+)',
+                r'(?i)news\s+(about|on|for|regarding|of)\s+(\w+)',
                 r'(?i)(\w+)\s+news',
-                r'(?i)latest\s+on\s+(\w+)',
+                r'(?i)latest\s+(on|about|for|of)\s+(\w+)',
+                r'(?i)what\'?s?\s+(happening|new|latest)\s+(with|on|about|for)\s+(\w+)',
+                r'(?i)(recent|latest)\s+news\s+(about|on|for|of)\s+(\w+)',
             ],
             QueryIntent.STOCK_ANALYSIS: [
                 r'(?i)(analyze|analysis|review)\s+(\w+)',

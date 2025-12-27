@@ -1,4 +1,3 @@
-
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import logging
@@ -11,48 +10,44 @@ from app.rag.retriever import get_retriever
 from app.analysis.storage import get_latest_analysis
 from app.models.news import NewsArticle
 from app.core.database import SessionLocal
+from app.agents.auto_agents import get_news_agent, get_analysis_agent, get_orchestrator
+from app.langchain_engine.llm_ticker_extractor import LLMTickerExtractor
 
 logger = logging.getLogger(__name__)
 
-
 class QueryHandlers:
-    """
-    Collection of specialized handlers for different query intents.
-    """
-    
     def __init__(self):
         self.chat_engine = ChatEngine()
+        self.orchestrator = get_orchestrator()
+        self.ticker_extractor = LLMTickerExtractor(self.chat_engine.llm)
     
     def handle_top_news(self, context: QueryContext, query: str) -> Dict:
-        logger.info("Handling top news query")
+        logger.info("Handling top news query with auto-fetch")
         
         db = SessionLocal()
         try:
             # Determine time period
-            days_back = 1  # Default to today
+            days_back = 1
             if context.time_period == 'this_week':
                 days_back = 7
             elif context.time_period == 'this_month':
                 days_back = 30
             elif context.time_period == 'recent':
                 days_back = 3
-            
-            cutoff_date = datetime.utcnow() - timedelta(days=days_back)
-            
-            # Get latest news articles
-            articles = (
-                db.query(NewsArticle)
-                .filter(NewsArticle.published_at >= cutoff_date)
-                .order_by(desc(NewsArticle.published_at))
-                .limit(10)
-                .all()
+
+            news_agent = get_news_agent(db)
+            articles = news_agent.get_or_fetch_news(
+                ticker=None,  # General news
+                days_back=days_back,
+                min_articles=5,  # Minimum articles needed
+                force_refresh=False
             )
             
             if not articles:
                 return {
                     'response': (
-                        "I don't have any recent news articles in the database. "
-                        "This could mean the data ingestion hasn't run yet.\n\n"
+                        "I tried to fetch the latest news but couldn't find any articles. "
+                        "This might be a temporary issue with news sources.\n\n"
                         "⚠️ **Disclaimer**: This is educational information only."
                     ),
                     'sources': [],
@@ -111,98 +106,155 @@ class QueryHandlers:
             db.close()
     
     def handle_stock_news(self, context: QueryContext, query: str) -> Dict:
-        logger.info(f"Handling stock news query for {context.tickers}")
-        
+        logger.info(f"Handling stock news query with LLM extraction + auto-fetch")
+
         if not context.tickers:
-            return {
-                'response': (
-                    "I need to know which stock you're asking about. "
-                    "Please mention a ticker symbol or company name.\n\n"
-                    "⚠️ **Disclaimer**: This is educational information only."
-                ),
-                'sources': [],
-                'ticker': None,
-                'context_retrieved': False
-            }
+            logger.info("🤖 Using LLM to extract ticker...")
+            extraction = self.ticker_extractor.extract_tickers(query)
+            
+            if extraction.has_ticker and extraction.tickers:
+                context.tickers = extraction.tickers
+                logger.info(f"✅ LLM extracted: {extraction.tickers}")
+            else:
+                return {
+                    'response': (
+                        "I need to know which stock you're asking about. "
+                        "Please mention a specific company name or ticker symbol.\n\n"
+                        "⚠️ **Disclaimer**: This is educational information only."
+                    ),
+                    'sources': [],
+                    'ticker': None,
+                    'context_retrieved': False
+                }
         
         ticker = context.tickers[0]
+        db = SessionLocal()
         
-        # Use RAG to get relevant news
-        retriever = get_retriever(ticker=ticker, k=5)
-        docs = retriever.invoke(f"latest news about {ticker}")
-        
-        if not docs:
+        try:
+            # Use AutoNewsAgent (auto-scrapes if needed)
+            news_agent = get_news_agent(db)
+            articles = news_agent.get_or_fetch_news(
+                ticker=ticker,
+                days_back=7,
+                min_articles=3,
+                force_refresh=False
+            )
+            
+            if not articles:
+                return {
+                    'response': (
+                        f"I tried to find news about {ticker} but couldn't get any recent articles. "
+                        f"This could mean:\n"
+                        f"1. The ticker might be incorrect\n"
+                        f"2. There's limited news coverage for this stock\n"
+                        f"3. News sources might be temporarily unavailable\n\n"
+                        "⚠️ **Disclaimer**: This is educational information only."
+                    ),
+                    'sources': [],
+                    'ticker': ticker,
+                    'context_retrieved': False
+                }
+            
+            # Format news
+            news_text = "\n\n".join([
+                f"**{article.title}**\n"
+                f"Source: {article.source}\n"
+                f"Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}\n"
+                f"{article.content[:300] if article.content else 'No content'}..."
+                for article in articles[:5]
+            ])
+            
+            # Create prompt
+            prompt = f"""
+            The user asked: "{query}"
+            
+            Here is the latest news about {ticker}:
+            
+            {news_text}
+            
+            Summarize the key news and sentiment around {ticker}. Highlight:
+            1. Major developments
+            2. Overall sentiment (positive/negative/neutral)
+            3. Potential impact on the stock
+            
+            ⚠️ **Disclaimer**: This is educational information only, not financial advice.
+            """
+            
+            result = self.chat_engine.llm.invoke(prompt)
+            
+            sources = [
+                {
+                    'title': article.title,
+                    'url': article.url,
+                    'source': article.source,
+                    'published_at': article.published_at.isoformat(),
+                    'similarity': 1.0
+                }
+                for article in articles
+            ]
+            
             return {
-                'response': (
-                    f"I don't have any recent news about {ticker} in the database.\n\n"
-                    "⚠️ **Disclaimer**: This is educational information only."
-                ),
-                'sources': [],
+                'response': result.content,
+                'sources': sources,
                 'ticker': ticker,
-                'context_retrieved': False
+                'context_retrieved': True,
+                'timestamp': datetime.utcnow().isoformat()
             }
-        
-        # Format news
-        news_text = "\n\n".join([
-            f"**{doc.metadata.get('title')}**\n"
-            f"Source: {doc.metadata.get('source')}\n"
-            f"Published: {doc.metadata.get('published_at')}\n"
-            f"{doc.page_content[:300]}..."
-            for doc in docs
-        ])
-        
-        # Create prompt
-        prompt = f"""
-        The user asked: "{query}"
-        
-        Here is the latest news about {ticker}:
-        
-        {news_text}
-        
-        Summarize the key news and sentiment around {ticker}. Highlight:
-        1. Major developments
-        2. Overall sentiment (positive/negative/neutral)
-        3. Potential impact on the stock
-        
-        ⚠️ **Disclaimer**: This is educational information only, not financial advice.
-        """
-        
-        result = self.chat_engine.llm.invoke(prompt)
-        
-        sources = [
-            {
-                'title': doc.metadata.get('title'),
-                'url': doc.metadata.get('url'),
-                'source': doc.metadata.get('source'),
-                'published_at': doc.metadata.get('published_at'),
-                'similarity': doc.metadata.get('similarity', 0.0)
-            }
-            for doc in docs
-        ]
-        
-        return {
-            'response': result.content,
-            'sources': sources,
-            'ticker': ticker,
-            'context_retrieved': True,
-            'timestamp': datetime.utcnow().isoformat()
-        }
+            
+        finally:
+            db.close()
     
     def handle_stock_analysis(self, context: QueryContext, query: str) -> Dict:
-        logger.info(f"Handling stock analysis for {context.tickers}")
-        
+        logger.info(f"Handling stock analysis with LLM extraction + auto-pipeline")
+    
         if not context.tickers:
-            return {
-                'response': "Please specify which stock you want me to analyze.",
-                'sources': [],
-                'ticker': None,
-                'context_retrieved': False
-            }
+            logger.info("🤖 Using LLM to extract ticker...")
+            extraction = self.ticker_extractor.extract_tickers(query)
+            
+            if extraction.has_ticker and extraction.tickers:
+                context.tickers = extraction.tickers
+                logger.info(f"✅ LLM extracted: {extraction.tickers}")
+            else:
+                return {
+                    'response': "Please specify which stock you want me to analyze.",
+                    'sources': [],
+                    'ticker': None,
+                    'context_retrieved': False
+                }
         
         ticker = context.tickers[0]
+        db = SessionLocal()
         
-        # Use the original generate_response method (it's perfect for this)
-        return self.chat_engine.generate_response(query=query, ticker=ticker)
+        try:
+            logger.info(f"🤖 Running automated pipeline for {ticker}...")
+            
+            data = self.orchestrator.get_complete_stock_data(
+                ticker=ticker,
+                force_refresh=False
+            )
+            
+            if not data['success'] or not data['analysis']:
+                error_details = ', '.join(data.get('errors', ['Unknown error']))
+                return {
+                    'response': (
+                        f"I encountered issues analyzing {ticker}:\n"
+                        f"{error_details}\n\n"
+                        f"This could mean:\n"
+                        f"1. Invalid ticker symbol\n"
+                        f"2. No price data available\n"
+                        f"3. Data source temporarily unavailable\n\n"
+                        "Try asking about: AAPL, MSFT, GOOGL, RELIANCE, TCS, or INFY.\n\n"
+                        "⚠️ **Disclaimer**: This is educational information only."
+                    ),
+                    'sources': [],
+                    'ticker': ticker,
+                    'context_retrieved': False
+                }
+            
+            return self.chat_engine.generate_response(query=query, ticker=ticker)
+            
+        finally:
+            db.close()
     
     def handle_stock_recommendation(self, context: QueryContext, query: str) -> Dict:
         logger.info("Handling stock recommendation query")
@@ -214,7 +266,7 @@ class QueryHandlers:
             
             buy_signals = (
                 db.query(Analysis)
-                .filter(Analysis.signal == 'BUY')
+                .filter(Analysis.signal.in_(['BUY', 'STRONG_BUY']))
                 .order_by(desc(Analysis.confidence))
                 .limit(5)
                 .all()
@@ -223,8 +275,9 @@ class QueryHandlers:
             if not buy_signals:
                 return {
                     'response': (
-                        "I don't have enough analysis data to recommend stocks at this time. "
-                        "Please try asking about specific stocks instead.\n\n"
+                        "I don't have enough recent analysis data to recommend stocks. "
+                        "Try asking about specific stocks like AAPL, MSFT, or RELIANCE, "
+                        "and I'll analyze them for you.\n\n"
                         "⚠️ **Disclaimer**: This is educational information only, not financial advice."
                     ),
                     'sources': [],
@@ -233,23 +286,14 @@ class QueryHandlers:
                 }
             
             # Format recommendations
+            import json
             recommendations_text = "\n\n".join([
                 f"**{analysis.ticker}**\n"
                 f"- Signal: {analysis.signal}\n"
-                f"- Confidence: {analysis.confidence:.1%}\n"
-                f"- RSI: {analysis.rsi:.1f}\n"
-                f"- Key Reasons: {analysis.reason[:200]}..."
+                f"- Confidence: {float(analysis.confidence):.1%}\n"
+                f"- RSI: {float(analysis.rsi):.1f}\n"
+                f"- Key Reasons: {json.loads(analysis.reason)[0] if analysis.reason else 'N/A'}"
                 for analysis in buy_signals
-            ])
-            
-            # Get news for top recommendation
-            top_ticker = buy_signals[0].ticker
-            retriever = get_retriever(ticker=top_ticker, k=3)
-            news_docs = retriever.invoke(f"latest news {top_ticker}")
-            
-            news_text = "\n".join([
-                f"- {doc.metadata.get('title')}"
-                for doc in news_docs[:3]
             ])
             
             prompt = f"""
@@ -258,9 +302,6 @@ class QueryHandlers:
             Based on technical analysis, here are stocks with BUY signals:
             
             {recommendations_text}
-            
-            Recent news for top recommendation ({top_ticker}):
-            {news_text}
             
             Provide a balanced recommendation discussing:
             1. Top 3 stocks with strongest signals
@@ -285,7 +326,6 @@ class QueryHandlers:
             db.close()
     
     def handle_price_prediction(self, context: QueryContext, query: str) -> Dict:
-        """Handle price prediction queries."""
         logger.info(f"Handling price prediction for {context.tickers}")
         
         if not context.tickers:
@@ -297,16 +337,10 @@ class QueryHandlers:
             }
         
         ticker = context.tickers[0]
-        
-        # Get analysis and news
-        return self.chat_engine.generate_response(
-            query=f"What is the price outlook for {ticker}? Where do you see the price going?",
-            ticker=ticker
-        )
+        return self.handle_stock_analysis(context, query)
     
     def handle_compare_stocks(self, context: QueryContext, query: str) -> Dict:
-        """Handle stock comparison queries."""
-        logger.info(f"Handling comparison for {context.tickers}")
+        logger.info(f"Handling comparison for {context.tickers} with auto-analysis")
         
         if len(context.tickers) < 2:
             return {
@@ -317,31 +351,49 @@ class QueryHandlers:
             }
         
         ticker1, ticker2 = context.tickers[0], context.tickers[1]
-        
-        # Get analysis for both
         db = SessionLocal()
+        
         try:
-            analysis1 = get_latest_analysis(db, ticker1)
-            analysis2 = get_latest_analysis(db, ticker2)
+            # ✅ NEW: Auto-analyze both stocks
+            analysis_agent = get_analysis_agent(db)
+            
+            logger.info(f"Auto-analyzing {ticker1}...")
+            analysis1 = analysis_agent.get_latest_or_create(ticker1)
+            
+            logger.info(f"Auto-analyzing {ticker2}...")
+            analysis2 = analysis_agent.get_latest_or_create(ticker2)
             
             if not analysis1 or not analysis2:
+                missing = []
+                if not analysis1:
+                    missing.append(ticker1)
+                if not analysis2:
+                    missing.append(ticker2)
+                
                 return {
-                    'response': f"I don't have enough data to compare {ticker1} and {ticker2}.",
+                    'response': (
+                        f"I couldn't analyze {', '.join(missing)}. "
+                        f"This might be due to insufficient data or invalid ticker symbols.\n\n"
+                        "⚠️ **Disclaimer**: This is educational information only."
+                    ),
                     'sources': [],
                     'ticker': None,
                     'context_retrieved': False
                 }
             
+            import json
             comparison_text = f"""
             **{ticker1}**:
             - Signal: {analysis1.signal}
-            - Confidence: {analysis1.confidence:.1%}
-            - RSI: {analysis1.rsi:.1f}
+            - Confidence: {float(analysis1.confidence):.1%}
+            - RSI: {float(analysis1.rsi):.1f}
+            - Reasons: {json.loads(analysis1.reason)[0] if analysis1.reason else 'N/A'}
             
             **{ticker2}**:
             - Signal: {analysis2.signal}
-            - Confidence: {analysis2.confidence:.1%}
-            - RSI: {analysis2.rsi:.1f}
+            - Confidence: {float(analysis2.confidence):.1%}
+            - RSI: {float(analysis2.rsi):.1f}
+            - Reasons: {json.loads(analysis2.reason)[0] if analysis2.reason else 'N/A'}
             """
             
             prompt = f"""
@@ -397,7 +449,6 @@ class QueryHandlers:
         }
     
     def handle_general_question(self, context: QueryContext, query: str) -> Dict:
-        """Handle general questions about investing/markets."""
         prompt = f"""
         Answer this question about investing/stock markets:
         
@@ -420,35 +471,47 @@ class QueryHandlers:
         }
     
     def handle_market_overview(self, context: QueryContext, query: str) -> Dict:
-        """Handle market overview queries."""
-        logger.info("Handling market overview query")
+        logger.info("Handling market overview query with auto-fetch")
         
         db = SessionLocal()
         try:
-            # Get summary stats across all analyses
-            from app.models.stock import Analysis
+            # ✅ NEW: Use orchestrator for market data
+            data = self.orchestrator.get_market_overview_data(force_refresh=False)
             
-            total = db.query(Analysis).count()
-            buy_count = db.query(Analysis).filter(Analysis.signal == 'BUY').count()
-            sell_count = db.query(Analysis).filter(Analysis.signal == 'SELL').count()
-            hold_count = db.query(Analysis).filter(Analysis.signal == 'HOLD').count()
+            if not data['success']:
+                return {
+                    'response': (
+                        "I couldn't fetch market overview data at the moment. "
+                        "Please try again later.\n\n"
+                        "⚠️ **Disclaimer**: This is educational information only."
+                    ),
+                    'sources': [],
+                    'ticker': None,
+                    'context_retrieved': False
+                }
+            
+            # Format overview
+            stats = data.get('market_stats', {})
+            news_count = len(data.get('news', []))
             
             overview_text = f"""
-            Market signals across {total} stocks:
-            - BUY signals: {buy_count} ({buy_count/total*100:.1f}%)
-            - SELL signals: {sell_count} ({sell_count/total*100:.1f}%)
-            - HOLD signals: {hold_count} ({hold_count/total*100:.1f}%)
+            Recent market data:
+            - Total stocks analyzed: {stats.get('total_stocks', 0)}
+            - BUY signals: {stats.get('buy_signals', 0)}
+            - SELL signals: {stats.get('sell_signals', 0)}
+            - HOLD signals: {stats.get('hold_signals', 0)}
+            - Recent news articles: {news_count}
             """
             
             prompt = f"""
-            Provide a market overview based on this signal distribution:
+            Provide a market overview based on this data:
             
             {overview_text}
             
             Discuss:
-            1. Overall market sentiment
-            2. What these signals suggest
-            3. General advice for investors
+            1. Overall market sentiment based on signal distribution
+            2. What these signals suggest about the market
+            3. General guidance for investors
             
             ⚠️ **Disclaimer**: This is educational information only, not financial advice.
             """
