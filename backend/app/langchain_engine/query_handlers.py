@@ -12,6 +12,7 @@ from app.models.news import NewsArticle
 from app.core.database import SessionLocal
 from app.agents.auto_agents import get_news_agent, get_analysis_agent, get_orchestrator
 from app.langchain_engine.llm_ticker_extractor import LLMTickerExtractor
+from app.ingestion.news_scraper import MultiSourceNewsScraper
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +23,13 @@ class QueryHandlers:
         self.ticker_extractor = LLMTickerExtractor(self.chat_engine.llm)
     
     def handle_top_news(self, context: QueryContext, query: str) -> Dict:
-        logger.info("Handling top news query with auto-fetch")
+
+        logger.info("🔥 Handling top news query with FRESH data scraping")
         
         db = SessionLocal()
         try:
             # Determine time period
-            days_back = 1
+            days_back = 1  # Always get TODAY's news
             if context.time_period == 'this_week':
                 days_back = 7
             elif context.time_period == 'this_month':
@@ -35,19 +37,52 @@ class QueryHandlers:
             elif context.time_period == 'recent':
                 days_back = 3
 
-            news_agent = get_news_agent(db)
-            articles = news_agent.get_or_fetch_news(
-                ticker=None,  # General news
-                days_back=days_back,
-                min_articles=5,  # Minimum articles needed
-                force_refresh=False
-            )
+            logger.info(f"🌐 Fetching fresh news from web sources...")
+            scraper = MultiSourceNewsScraper()
             
-            if not articles:
+            # Get news for top Indian stocks
+            top_tickers = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']
+            all_fresh_articles = []
+            
+            for ticker in top_tickers:
+                try:
+                    articles = scraper.fetch_all_articles(ticker, days_back=1)
+                    if articles:
+                        from app.ingestion.storage import store_news_articles
+                        store_news_articles(db, articles)
+                        all_fresh_articles.extend(articles)
+                        logger.info(f"✅ Scraped {len(articles)} articles for {ticker}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to scrape {ticker}: {e}")
+                    continue
+            
+
+            try:
+                market_news = scraper.get_market_news('india', days_back=1)
+                if market_news:
+                    from app.ingestion.storage import store_news_articles
+                    store_news_articles(db, market_news)
+                    all_fresh_articles.extend(market_news)
+                    logger.info(f"✅ Scraped {len(market_news)} general market articles")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to scrape market news: {e}")
+            
+            if not all_fresh_articles:
+                cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+                all_fresh_articles = (
+                    db.query(NewsArticle)
+                    .filter(NewsArticle.published_at >= cutoff_date)
+                    .order_by(NewsArticle.published_at.desc())
+                    .limit(15)
+                    .all()
+                )
+                logger.info(f"⚠️ Using {len(all_fresh_articles)} articles from DB as fallback")
+            
+            if not all_fresh_articles:
                 return {
                     'response': (
-                        "I tried to fetch the latest news but couldn't find any articles. "
-                        "This might be a temporary issue with news sources.\n\n"
+                        "I couldn't fetch the latest news at the moment. "
+                        "Please try again in a few moments.\n\n"
                         "⚠️ **Disclaimer**: This is educational information only."
                     ),
                     'sources': [],
@@ -55,31 +90,52 @@ class QueryHandlers:
                     'context_retrieved': False
                 }
             
-            # Format news for prompt
-            news_text = self._format_news_list(articles)
+            all_fresh_articles.sort(key=lambda x: x.published_at, reverse=True)
+            top_articles = all_fresh_articles[:10]
             
-            # Create custom prompt
-            prompt = f"""
-            The user asked: "{query}"
+            articles_text = ""
+            for i, article in enumerate(top_articles, 1):
+                articles_text += f"""
+    {i}. **{article.title}**
+    Company: {article.ticker}
+    Source: {article.source}
+    Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}
+    Summary: {article.content[:200] if article.content else 'No summary available'}...
+    
+    """
             
-            Here are the latest news articles from the past {days_back} day(s):
+            prompt = f"""You are a financial news analyst. Here are today's top 10 stock market news articles:
+
+    {articles_text}
+
+    **Task**: Provide a professional summary of today's top news stories.
+
+    **Format your response as:**
+
+    📰 **Today's Top Market News**
+
+    [Provide a brief 2-3 sentence overview of the overall market sentiment]
+
+    **Key Stories:**
+
+    1. [First story headline and key takeaway in 1-2 sentences]
+
+    2. [Second story headline and key takeaway]
+
+    3. [Third story headline and key takeaway]
+
+    [Continue for all major stories]
+
+    **Market Sentiment**: [Overall positive/negative/mixed and why]
+
+    Keep each story summary concise (1-2 sentences). Focus on what investors need to know.
+
+    ⚠️ **Disclaimer**: This is educational information only, not financial advice. Always do your own research and consult a financial advisor before making investment decisions.
+    """
             
-            {news_text}
-            
-            Provide a summary of the top news stories, highlighting:
-            1. Major market trends
-            2. Significant company announcements
-            3. Any notable events affecting stocks
-            
-            Keep it concise and informative.
-            
-            ⚠️ **Disclaimer**: This is educational information only, not financial advice.
-            """
-            
-            # Generate response
+            logger.info("🤖 Generating LLM summary of news...")
             result = self.chat_engine.llm.invoke(prompt)
             
-            # Format sources
             sources = [
                 {
                     'title': article.title,
@@ -89,11 +145,16 @@ class QueryHandlers:
                     'ticker': article.ticker,
                     'similarity': 1.0
                 }
-                for article in articles
+                for article in top_articles
             ]
             
+            response_with_links = result.content + "\n\n---\n\n**📑 Full Articles:**\n\n"
+            for i, article in enumerate(top_articles, 1):
+                response_with_links += f"{i}. [{article.title}]({article.url})\n"
+                response_with_links += f"   🏢 {article.ticker} | 📰 {article.source} | 📅 {article.published_at.strftime('%Y-%m-%d')}\n\n"
+            
             return {
-                'response': result.content,
+                'response': response_with_links,
                 'sources': sources,
                 'ticker': None,
                 'signal': None,
@@ -104,97 +165,131 @@ class QueryHandlers:
             
         finally:
             db.close()
-    
+        
     def handle_stock_news(self, context: QueryContext, query: str) -> Dict:
-        logger.info(f"Handling stock news query with LLM extraction + auto-fetch")
+        """Handle stock-specific news with FRESH scraping + LLM extraction."""
+        logger.info(f"📰 Handling stock news query: '{query}'")
+
 
         if not context.tickers:
-            logger.info("🤖 Using LLM to extract ticker...")
-            extraction = self.ticker_extractor.extract_tickers(query)
-            
-            if extraction.has_ticker and extraction.tickers:
-                context.tickers = extraction.tickers
-                logger.info(f"✅ LLM extracted: {extraction.tickers}")
-            else:
-                return {
-                    'response': (
-                        "I need to know which stock you're asking about. "
-                        "Please mention a specific company name or ticker symbol.\n\n"
-                        "⚠️ **Disclaimer**: This is educational information only."
-                    ),
-                    'sources': [],
-                    'ticker': None,
-                    'context_retrieved': False
-                }
+            logger.info("🤖 Using LLM to extract ticker from query...")
+        extraction = self.ticker_extractor.extract_tickers(query)
         
-        ticker = context.tickers[0]
+        if extraction.has_ticker and extraction.tickers:
+            context.tickers = extraction.tickers
+            logger.info(f"✅ LLM extracted tickers: {extraction.tickers}")
+        else:
+            return {
+                'response': (
+                    "I need to know which stock you're asking about. "
+                    "Please mention a specific company name or ticker symbol "
+                    "(e.g., 'News about Apple', 'Latest on RELIANCE', 'TCS updates').\n\n"
+                    "**Popular stocks**: AAPL, MSFT, GOOGL, RELIANCE, TCS, INFY\n\n"
+                    "⚠️ **Disclaimer**: This is educational information only."
+                ),
+                'sources': [],
+                'ticker': None,
+                'context_retrieved': False
+            }
+    
+        ticker = context.tickers[0].upper()
         db = SessionLocal()
-        
+    
         try:
-            # Use AutoNewsAgent (auto-scrapes if needed)
-            news_agent = get_news_agent(db)
-            articles = news_agent.get_or_fetch_news(
-                ticker=ticker,
-                days_back=7,
-                min_articles=3,
-                force_refresh=False
+            logger.info(f"🌐 Fetching FRESH news for {ticker} from web...")
+            scraper = MultiSourceNewsScraper()
+            fresh_articles = scraper.fetch_all_articles(ticker, days_back=3)
+        
+            if fresh_articles:
+                from app.ingestion.storage import store_news_articles
+                stored = store_news_articles(db, fresh_articles)
+                logger.info(f"✅ Stored {stored} fresh articles for {ticker}")
+        
+
+            cutoff_date = datetime.utcnow() - timedelta(days=7)
+            all_articles = (
+                db.query(NewsArticle)
+                .filter(
+                NewsArticle.ticker == ticker,
+                NewsArticle.published_at >= cutoff_date
+                )
+                .order_by(NewsArticle.published_at.desc())
+                .limit(10)
+                .all()
             )
-            
-            if not articles:
+        
+            if not all_articles:
                 return {
-                    'response': (
-                        f"I tried to find news about {ticker} but couldn't get any recent articles. "
-                        f"This could mean:\n"
-                        f"1. The ticker might be incorrect\n"
-                        f"2. There's limited news coverage for this stock\n"
-                        f"3. News sources might be temporarily unavailable\n\n"
-                        "⚠️ **Disclaimer**: This is educational information only."
-                    ),
-                    'sources': [],
-                    'ticker': ticker,
-                    'context_retrieved': False
+               'response': (
+                    f"I couldn't find recent news about {ticker}. This could mean:\n"
+                    f"1. The ticker might be spelled differently (check the exact symbol)\n"
+                    f"2. Limited news coverage for this stock\n"
+                    f"3. Try asking: 'Latest news on [company full name]'\n\n"
+                    f"💡 **Tip**: Try 'What's the latest news?' for general market updates.\n\n"
+                    "⚠️ **Disclaimer**: This is educational information only."
+                ),
+                'sources': [],
+                'ticker': ticker,
+                'context_retrieved': False
                 }
+        
+            articles_text = ""
+            for i, article in enumerate(all_articles, 1):
+                articles_text += f"""
+            {i}. **{article.title}**
+            Source: {article.source}
+            Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}
+            Content: {article.content[:300] if article.content else 'No content'}...
             
-            # Format news
-            news_text = "\n\n".join([
-                f"**{article.title}**\n"
-                f"Source: {article.source}\n"
-                f"Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}\n"
-                f"{article.content[:300] if article.content else 'No content'}..."
-                for article in articles[:5]
-            ])
-            
-            # Create prompt
-            prompt = f"""
-            The user asked: "{query}"
-            
-            Here is the latest news about {ticker}:
-            
-            {news_text}
-            
-            Summarize the key news and sentiment around {ticker}. Highlight:
-            1. Major developments
-            2. Overall sentiment (positive/negative/neutral)
-            3. Potential impact on the stock
-            
+            """
+            prompt = f"""Analyze these recent news articles about {ticker}:
+
+            {articles_text}
+
+            **Task**: Provide a comprehensive news summary for {ticker}.
+
+            **Format:**
+
+            📰 **Latest News for {ticker}**
+
+            **Quick Summary**: [2-3 sentence overview of recent developments]
+
+            **Key Developments**:
+            - [Major development 1]
+            - [Major development 2]
+            - [Major development 3]
+
+            **Sentiment Analysis**: 
+            - Overall sentiment: [Positive/Negative/Neutral]
+            - Why: [Brief explanation]
+
+            **Investor Takeaway**: [What this means for investors in 1-2 sentences]
+
+            Keep it concise and factual. Focus on what matters to investors.
+
             ⚠️ **Disclaimer**: This is educational information only, not financial advice.
             """
             
             result = self.chat_engine.llm.invoke(prompt)
-            
+                
+            response_with_links = result.content + "\n\n---\n\n**📑 Source Articles:**\n\n"
+            for i, article in enumerate(all_articles, 1):
+                    response_with_links += f"{i}. [{article.title}]({article.url})\n"
+                    response_with_links += f"   📰 {article.source} | 📅 {article.published_at.strftime('%Y-%m-%d')}\n\n"
+                
             sources = [
-                {
-                    'title': article.title,
-                    'url': article.url,
-                    'source': article.source,
-                    'published_at': article.published_at.isoformat(),
-                    'similarity': 1.0
-                }
-                for article in articles
-            ]
-            
+                    {
+                        'title': article.title,
+                        'url': article.url,
+                        'source': article.source,
+                        'published_at': article.published_at.isoformat(),
+                        'similarity': 1.0
+                    }
+                    for article in all_articles
+                ]
+                
             return {
-                'response': result.content,
+                'response': response_with_links,
                 'sources': sources,
                 'ticker': ticker,
                 'context_retrieved': True,
@@ -205,123 +300,218 @@ class QueryHandlers:
             db.close()
     
     def handle_stock_analysis(self, context: QueryContext, query: str) -> Dict:
-        logger.info(f"Handling stock analysis with LLM extraction + auto-pipeline")
-    
+        logger.info(f"📊 Handling stock analysis: '{query}'")
+
+
         if not context.tickers:
             logger.info("🤖 Using LLM to extract ticker...")
-            extraction = self.ticker_extractor.extract_tickers(query)
-            
-            if extraction.has_ticker and extraction.tickers:
-                context.tickers = extraction.tickers
-                logger.info(f"✅ LLM extracted: {extraction.tickers}")
-            else:
-                return {
-                    'response': "Please specify which stock you want me to analyze.",
-                    'sources': [],
-                    'ticker': None,
-                    'context_retrieved': False
-                }
+        extraction = self.ticker_extractor.extract_tickers(query)
         
-        ticker = context.tickers[0]
+        if extraction.has_ticker and extraction.tickers:
+            context.tickers = extraction.tickers
+            logger.info(f"✅ LLM extracted: {extraction.tickers}")
+        else:
+            return {
+                'response': (
+                    "Please specify which stock you want me to analyze.\n\n"
+                    "**Examples**: 'Analyze AAPL', 'Should I buy Reliance?', 'How is TCS doing?'\n\n"
+                    "⚠️ **Disclaimer**: This is educational information only."
+                ),
+                'sources': [],
+                'ticker': None,
+                'context_retrieved': False
+            }
+    
+        ticker = context.tickers[0].upper()
         db = SessionLocal()
-        
+    
         try:
             logger.info(f"🤖 Running automated pipeline for {ticker}...")
-            
+        
             data = self.orchestrator.get_complete_stock_data(
                 ticker=ticker,
-                force_refresh=False
+                force_refresh=False 
             )
-            
+        
             if not data['success'] or not data['analysis']:
                 error_details = ', '.join(data.get('errors', ['Unknown error']))
                 return {
-                    'response': (
-                        f"I encountered issues analyzing {ticker}:\n"
-                        f"{error_details}\n\n"
-                        f"This could mean:\n"
-                        f"1. Invalid ticker symbol\n"
-                        f"2. No price data available\n"
-                        f"3. Data source temporarily unavailable\n\n"
-                        "Try asking about: AAPL, MSFT, GOOGL, RELIANCE, TCS, or INFY.\n\n"
-                        "⚠️ **Disclaimer**: This is educational information only."
-                    ),
-                    'sources': [],
-                    'ticker': ticker,
-                    'context_retrieved': False
+                'response': (
+                    f"I encountered issues analyzing {ticker}:\n"
+                    f"**Error**: {error_details}\n\n"
+                    f"**Possible reasons**:\n"
+                    f"1. Invalid or unrecognized ticker symbol\n"
+                    f"2. No price data available for this stock\n"
+                    f"3. Data source temporarily unavailable\n\n"
+                    f"💡 **Try these popular tickers**: AAPL, MSFT, GOOGL, RELIANCE, TCS, INFY\n\n"
+                    "⚠️ **Disclaimer**: This is educational information only."
+                ),
+                'sources': [],
+                'ticker': ticker,
+                'context_retrieved': False
                 }
+        
+            logger.info(f"📰 Fetching fresh news for {ticker}...")
+            scraper = MultiSourceNewsScraper()
+            fresh_news = scraper.fetch_all_articles(ticker, days_back=7)
+        
+            if fresh_news:
+                from app.ingestion.storage import store_news_articles
+                store_news_articles(db, fresh_news)
+        
+
+            cutoff_date = datetime.utcnow() - timedelta(days=7)
+            news_articles = (
+                db.query(NewsArticle)
+                .filter(
+                NewsArticle.ticker == ticker,
+                NewsArticle.published_at >= cutoff_date
+                )
+                .order_by(NewsArticle.published_at.desc())
+                .limit(5)
+                .all()
+            )
+        
+            news_context = ""
+            if news_articles:
+                news_context = "**Recent News**:\n"
+            for article in news_articles:
+                news_context += f"• {article.title} ({article.source}, {article.published_at.strftime('%Y-%m-%d')})\n"
+                if article.content:
+                    news_context += f"  {article.content[:150]}...\n"
+            else:
+                news_context = "No recent news available."
+        
+            analysis = data['analysis']
+            import json
+        
+            enhanced_query = f"""
+            Provide a comprehensive analysis of {ticker} combining technical indicators and recent news.
+
+        **Technical Analysis**:
+        - Signal: {analysis.signal}
+        - Confidence: {float(analysis.confidence):.1%}
+        - RSI: {float(analysis.rsi) if analysis.rsi else 'N/A'}
+        - MACD: {float(analysis.macd_histogram) if analysis.macd_histogram else 'N/A'}
+        - Key Reasons: {json.loads(analysis.reason) if analysis.reason else []}
+
+        {news_context}
+
+        **Your Task**: 
+        1. Explain what the technical signals mean
+        2. Analyze how recent news affects the outlook
+        3. Provide a clear recommendation (BUY/SELL/HOLD) with reasoning
+        4. Mention key risks investors should consider
+
+        Be specific and actionable. Format with clear sections.
+        """
             
-            return self.chat_engine.generate_response(query=query, ticker=ticker)
-            
+            return self.chat_engine.generate_response(
+                query=enhanced_query,
+                ticker=ticker
+            )
+        
         finally:
             db.close()
     
     def handle_stock_recommendation(self, context: QueryContext, query: str) -> Dict:
-        logger.info("Handling stock recommendation query")
         
+        logger.info("💡 Handling stock recommendation with fresh data")
+    
         db = SessionLocal()
         try:
-            # Get latest analyses with BUY signals
-            from app.models.stock import Analysis
-            
-            buy_signals = (
-                db.query(Analysis)
-                .filter(Analysis.signal.in_(['BUY', 'STRONG_BUY']))
-                .order_by(desc(Analysis.confidence))
-                .limit(5)
-                .all()
-            )
-            
-            if not buy_signals:
+            top_tickers = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK', 
+                      'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+        
+            logger.info(f"🔄 Ensuring fresh analysis for {len(top_tickers)} stocks...")
+            analysis_agent = get_analysis_agent(db)
+        
+            fresh_analyses = []
+            for ticker in top_tickers:
+                try:
+                    analysis = analysis_agent.get_latest_or_create(ticker)
+                    if analysis and analysis.signal in ['BUY', 'STRONG_BUY']:
+                        fresh_analyses.append(analysis)
+                        logger.info(f"✅ {ticker}: {analysis.signal}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to analyze {ticker}: {e}")
+                    continue
+        
+            fresh_analyses.sort(key=lambda x: float(x.confidence), reverse=True)
+            top_picks = fresh_analyses[:5]
+        
+            if not top_picks:
                 return {
-                    'response': (
-                        "I don't have enough recent analysis data to recommend stocks. "
-                        "Try asking about specific stocks like AAPL, MSFT, or RELIANCE, "
-                        "and I'll analyze them for you.\n\n"
-                        "⚠️ **Disclaimer**: This is educational information only, not financial advice."
-                    ),
-                    'sources': [],
-                    'ticker': None,
-                    'context_retrieved': False
-                }
-            
-            # Format recommendations
-            import json
-            recommendations_text = "\n\n".join([
-                f"**{analysis.ticker}**\n"
-                f"- Signal: {analysis.signal}\n"
-                f"- Confidence: {float(analysis.confidence):.1%}\n"
-                f"- RSI: {float(analysis.rsi):.1f}\n"
-                f"- Key Reasons: {json.loads(analysis.reason)[0] if analysis.reason else 'N/A'}"
-                for analysis in buy_signals
-            ])
-            
-            prompt = f"""
-            The user asked: "{query}"
-            
-            Based on technical analysis, here are stocks with BUY signals:
-            
-            {recommendations_text}
-            
-            Provide a balanced recommendation discussing:
-            1. Top 3 stocks with strongest signals
-            2. Key factors supporting these recommendations
-            3. Important risks to consider
-            
-            ⚠️ **Critical**: Emphasize this is NOT financial advice and users should do their own research.
-            """
-            
-            result = self.chat_engine.llm.invoke(prompt)
-            
-            return {
-                'response': result.content,
+                'response': (
+                    "I'm currently analyzing market conditions. Please try again in a moment, "
+                    "or ask about specific stocks like:\n"
+                    "• 'Analyze RELIANCE'\n"
+                    "• 'Should I buy TCS?'\n"
+                    "• 'How is AAPL doing?'\n\n"
+                    "⚠️ **Disclaimer**: This is NOT financial advice."
+                ),
                 'sources': [],
                 'ticker': None,
-                'recommendations': [analysis.ticker for analysis in buy_signals],
-                'context_retrieved': True,
-                'timestamp': datetime.utcnow().isoformat()
+                'context_retrieved': False
             }
-            
+        
+            import json
+            recommendations_text = ""
+            for i, analysis in enumerate(top_picks, 1):
+                reasons = json.loads(analysis.reason) if analysis.reason else []
+                recommendations_text += f"""
+{i}. **{analysis.ticker}**
+   - Signal: {analysis.signal}
+   - Confidence: {float(analysis.confidence):.1%}
+   - RSI: {float(analysis.rsi):.1f}
+   - Analysis Date: {analysis.date}
+   - Key Factor: {reasons[0] if reasons else 'Technical strength'}
+   
+"""
+        
+            prompt = f"""Based on fresh technical analysis, here are today's top stock picks with BUY signals:
+
+{recommendations_text}
+
+**Task**: Provide professional stock recommendations.
+
+**Format**:
+
+💼 **Top Stock Recommendations**
+
+**Overview**: [Brief market context]
+
+**Top 3 Picks**:
+
+1. **[Ticker]** - [Why it's a good pick in 2-3 sentences]
+   
+2. **[Ticker]** - [Why it's a good pick]
+
+3. **[Ticker]** - [Why it's a good pick]
+
+**Important Considerations**:
+- [Key risk factor 1]
+- [Key risk factor 2]
+- [Market condition to watch]
+
+**Investment Strategy**: [Brief guidance on approach]
+
+Be balanced - mention both opportunities AND risks.
+
+⚠️ **CRITICAL DISCLAIMER**: This is educational analysis only, NOT financial advice. Markets are risky. Past performance doesn't guarantee future results. Always do your own research and consult a licensed financial advisor before investing.
+"""
+        
+            result = self.chat_engine.llm.invoke(prompt)
+        
+            return {
+            'response': result.content,
+            'sources': [],
+            'ticker': None,
+            'recommendations': [a.ticker for a in top_picks],
+            'context_retrieved': True,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
         finally:
             db.close()
     

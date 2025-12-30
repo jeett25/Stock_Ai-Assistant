@@ -185,54 +185,55 @@ class AutoAnalysisAgent:
             return None
     
     def _ensure_price_data(
-        self,
-        ticker: str,
-        days_needed: int = 200
-    ) -> List[StockPrice]:
+    self,
+    ticker: str,
+    days_needed: int = 200
+) -> List[StockPrice]:
         try:
-            # Check existing data
             existing_prices = get_price_history(self.db, ticker, days_needed)
-            
-            # Check if we have enough recent data
+        
             if existing_prices:
                 most_recent = max(p.date for p in existing_prices)
                 days_old = (date.today() - most_recent).days
                 
                 if len(existing_prices) >= 50 and days_old <= 1:
-                    logger.info(
-                        f"✅ Found {len(existing_prices)} price records "
-                        f"(most recent: {most_recent})"
-                    )
+                    logger.info(f"✅ Found {len(existing_prices)} recent price records")
                     return existing_prices
-            
-            # Need fresh data
+        
             logger.info(f"🌐 Fetching price data for {ticker}...")
+        
             indian_tickers = {
                 'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK',
                 'HINDUNILVR', 'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK',
-                'BAJFINANCE', 'LT', 'ASIANPAINT', 'MARUTI', 'HCLTECH'
+                'BAJFINANCE', 'LT', 'ASIANPAINT', 'MARUTI', 'HCLTECH',
+                'BEL', 'HAL', 'POWERGRID', 'NTPC', 'COALINDIA',
+                'ONGC', 'IOC', 'BPCL', 'GAIL', 'ADANIENT',
+                'TATAMOTORS', 'TATASTEEL', 'SUNPHARMA', 'DRREDDY',
+                'CIPLA', 'DIVISLAB', 'BIOCON', 'WIPRO'
             }
-            exchange = 'NSE' if ticker in indian_tickers else 'US'
-            
-            # Fetch prices
+        
+            exchange = 'NSE' if ticker.upper() in indian_tickers else 'US'
+            logger.info(f"📍 Detected exchange: {exchange}")
+        
+
             fresh_prices = self.price_fetcher.fetch_prices(
-                ticker,
-                days_back=days_needed,
-                exchange=exchange
+            ticker,
+            days_back=days_needed,
+            exchange=exchange
             )
-            
+        
             if fresh_prices:
                 stored_count = store_stock_prices(self.db, fresh_prices)
-                logger.info(f"✅ Stored {stored_count} price records")
-                
-                # Retrieve from DB
+                logger.info(f"✅ Stored {stored_count} price records for {ticker}")
                 return get_price_history(self.db, ticker, days_needed)
             else:
                 logger.warning(f"⚠️ No prices fetched for {ticker}")
                 return existing_prices or []
-                
+            
         except Exception as e:
             logger.error(f"Error ensuring price data for {ticker}: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     def get_latest_or_create(self, ticker: str) -> Optional[Analysis]:
